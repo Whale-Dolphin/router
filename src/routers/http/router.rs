@@ -502,6 +502,50 @@ impl Router {
         })
     }
 
+    /// Extract routing text from a transparent-proxy JSON body for cache-aware
+    /// prefix matching.
+    ///
+    /// Mirrors sgl-router's `GenerateRequest::extract_text_for_routing()`:
+    ///   1. `"text"` field   → prompt string (SGLang /generate with text)
+    ///   2. `"prompt"` field → prompt string (OpenAI /completions style)
+    ///   3. `"token_ids"` / `"input_ids"` → join as decimal strings ("151644 8948 …")
+    ///   4. fallback → full JSON serialization (existing behavior)
+    ///
+    /// Without this, transparent-proxy requests contain a per-request UUID
+    /// (`request_id`) at the start of the serialized body, causing the radix
+    /// tree to diverge at character ~16 and collapsing cache_aware into
+    /// pure shortest-queue routing.
+    fn extract_routing_text_from_body(body: &serde_json::Value) -> Option<String> {
+        if let Some(text) = body.get("text").and_then(|v| v.as_str()) {
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+
+        if let Some(prompt) = body.get("prompt").and_then(|v| v.as_str()) {
+            if !prompt.is_empty() {
+                return Some(prompt.to_string());
+            }
+        }
+
+        let ids_field = body.get("token_ids").or_else(|| body.get("input_ids"));
+        if let Some(ids) = ids_field.and_then(|v| v.as_array()) {
+            if !ids.is_empty() {
+                let s: String = ids
+                    .iter()
+                    .filter_map(|v| v.as_i64())
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !s.is_empty() {
+                    return Some(s);
+                }
+            }
+        }
+
+        serde_json::to_string(body).ok()
+    }
+
     /// Select worker for a specific model considering circuit breaker state
     fn select_worker_for_model(
         &self,
@@ -1666,7 +1710,7 @@ impl RouterTrait for Router {
         }
 
         let policy = self.policy_registry.get_default_policy();
-        let request_text = serde_json::to_string(&body).ok();
+        let request_text = Self::extract_routing_text_from_body(&body);
         let request_headers = Self::headers_to_request_headers(headers);
         let worker_idx = match policy.select_worker_with_headers(
             &workers,
@@ -2204,5 +2248,105 @@ mod tests {
         );
 
         health_checker.shutdown().await;
+    }
+
+    // =============================
+    // Tests for extract_routing_text_from_body
+    // =============================
+
+    #[test]
+    fn test_extract_routing_text_prefers_text_field() {
+        let body = serde_json::json!({
+            "text": "prove the Pythagorean theorem",
+            "token_ids": [151644, 8948, 198],
+            "request_id": "a3f2c8e1-0000-0000-0000-000000000000"
+        });
+        let result = Router::extract_routing_text_from_body(&body);
+        assert_eq!(result, Some("prove the Pythagorean theorem".to_string()));
+    }
+
+    #[test]
+    fn test_extract_routing_text_prefers_prompt_over_token_ids() {
+        let body = serde_json::json!({
+            "prompt": "solve x^2 - 9 = 0",
+            "token_ids": [151644, 8948, 198],
+            "request_id": "b71e8000-0000-0000-0000-000000000000"
+        });
+        let result = Router::extract_routing_text_from_body(&body);
+        assert_eq!(result, Some("solve x^2 - 9 = 0".to_string()));
+    }
+
+    #[test]
+    fn test_extract_routing_text_token_ids_as_decimal_string() {
+        let body = serde_json::json!({
+            "token_ids": [151644, 8948, 198, 2610],
+            "request_id": "c9d04000-0000-0000-0000-000000000000"
+        });
+        let result = Router::extract_routing_text_from_body(&body);
+        assert_eq!(result, Some("151644 8948 198 2610".to_string()));
+    }
+
+    #[test]
+    fn test_extract_routing_text_input_ids_fallback() {
+        let body = serde_json::json!({
+            "input_ids": [100, 200, 300],
+            "request_id": "de52f000-0000-0000-0000-000000000000"
+        });
+        let result = Router::extract_routing_text_from_body(&body);
+        assert_eq!(result, Some("100 200 300".to_string()));
+    }
+
+    #[test]
+    fn test_extract_routing_text_token_ids_preferred_over_input_ids() {
+        let body = serde_json::json!({
+            "token_ids": [1, 2, 3],
+            "input_ids": [4, 5, 6]
+        });
+        let result = Router::extract_routing_text_from_body(&body);
+        assert_eq!(result, Some("1 2 3".to_string()));
+    }
+
+    #[test]
+    fn test_extract_routing_text_skips_empty_text() {
+        let body = serde_json::json!({
+            "text": "",
+            "token_ids": [151644, 8948]
+        });
+        let result = Router::extract_routing_text_from_body(&body);
+        assert_eq!(result, Some("151644 8948".to_string()));
+    }
+
+    #[test]
+    fn test_extract_routing_text_fallback_json_serialization() {
+        let body = serde_json::json!({
+            "custom_field": "no known routing fields",
+            "request_id": "unknown"
+        });
+        let result = Router::extract_routing_text_from_body(&body);
+        assert!(result.is_some());
+        let text = result.unwrap();
+        assert!(text.contains("custom_field"));
+        assert!(text.contains("no known routing fields"));
+    }
+
+    #[test]
+    fn test_extract_routing_text_same_prompt_produces_identical_key() {
+        let prompt_ids = vec![151644, 8948, 198, 2610, 105043, 102887];
+        let body_1 = serde_json::json!({
+            "token_ids": prompt_ids,
+            "request_id": "aaaa0000-0000-0000-0000-000000000001",
+            "sampling_params": {"temperature": 0.7}
+        });
+        let body_2 = serde_json::json!({
+            "token_ids": prompt_ids,
+            "request_id": "bbbb0000-0000-0000-0000-000000000002",
+            "sampling_params": {"temperature": 0.7}
+        });
+        let key_1 = Router::extract_routing_text_from_body(&body_1);
+        let key_2 = Router::extract_routing_text_from_body(&body_2);
+        assert_eq!(
+            key_1, key_2,
+            "Same token_ids with different request_ids must produce the same routing key"
+        );
     }
 }
