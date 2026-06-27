@@ -33,7 +33,7 @@ jobs:
           file: ./Dockerfile.router
           push: true
           tags: |
-            ${{ env.IMAGE }}:0.1.14-e667ebb
+            ${{ env.IMAGE }}:0.1.15-b6f69ad
             ${{ env.IMAGE }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
