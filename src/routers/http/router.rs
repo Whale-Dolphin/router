@@ -516,6 +516,16 @@ impl Router {
     /// tree to diverge at character ~16 and collapsing cache_aware into
     /// pure shortest-queue routing.
     fn extract_routing_text_from_body(body: &serde_json::Value) -> Option<String> {
+        if let Some(session_id) = body
+            .get("session_params")
+            .and_then(|sp| sp.get("session_id"))
+            .and_then(|s| s.as_str())
+        {
+            if !session_id.trim().is_empty() {
+                return Some(session_id.to_string());
+            }
+        }
+
         if let Some(text) = body.get("text").and_then(|v| v.as_str()) {
             if !text.is_empty() {
                 return Some(text.to_string());
