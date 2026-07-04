@@ -6,6 +6,7 @@ use crate::metrics::RouterMetrics;
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use tracing::debug;
 
 /// Power-of-two choices policy
 ///
