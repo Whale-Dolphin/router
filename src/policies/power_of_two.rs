@@ -79,7 +79,7 @@ impl LoadBalancingPolicy for PowerOfTwoPolicy {
             worker_idx2
         };
 
-        info!(
+        debug!(
             "Power-of-two selection: {}={} vs {}={} -> selected {}",
             workers[worker_idx1].url(),
             load1,
